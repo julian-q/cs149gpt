@@ -89,62 +89,49 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     //Format QK_t Tensor into a 2D vector.
     std::vector<float> QK_t = formatTensor(QK_tTensor);
     
-    /* Here is an example of how to read/write 0's to  Q (B, H, N, d) using the 4D accessors
-
-        //loop over Batch Size
-         for (int b = 0; b < B; b++) {
-
-             //loop over Heads
-             for (int h = 0; h < H; h++) {
-
-                 //loop over Sequence Length
-                 for (int i = 0; i < N; i++) {
-
-                     //loop over Embedding Dimensionality
-                     for (int j = 0; j < d; j++) {
-                        float val = fourDimRead(Q, b, h, i, j, H, N, d);
-                        val = 0.0;
-                        fourDimWrite(Q, b, h, i, j, H, N, d, val);
-                     }
-                 }
-             }
-         }
-    */
-
-    /* Here is an example of how to read/write 0's to  QK_t (N, N) using the 2D accessors
-
-           for (int i = 0; i < N; i++) {
-	       for (int j = 0; j < N; j++) {
-	           float val = twoDimRead(QK_t, i, j, N);
-               val = 0.0;
-	           twoDimWrite(QK_t, i, j, N, val);
-             }
-         }
-    */
-    
-    // -------- YOUR CODE HERE  -------- //
-    //loop over Batch Size
     for (int b = 0; b < B; b++) {
-
-         //loop over Heads
         for (int h = 0; h < H; h++) {
+            for (int qi = 0; qi < N; qi++) {
+                for (int ki = 0; ki < N; ki++) {
+                    float val = 0;
+                    for (int k = 0; k < d; k++) {
+                        float qval = fourDimRead(Q, b, h, qi, k, H, N, d);
+                        float kval = fourDimRead(K, b, h, ki, k, H, N, d);
+                        val += qval * kval;
+                    }
+                    twoDimWrite(QK_t, qi, ki, N, val);
+                }
+            }
 
-            //loop over Sequence Length
             for (int i = 0; i < N; i++) {
+                float sum = 0;
+                for (int j = 0; j < N; j++) {
+                    float val = twoDimRead(QK_t, i, j, N);
+                    val = exp(val);
+                    sum += val;
+                    twoDimWrite(QK_t, i, j, N, val);
+                }
+                for (int j = 0; j < N; j++) {
+                    float val = twoDimRead(QK_t, i, j, N);
+                    val /= sum;
+                    twoDimWrite(QK_t, i, j, N, val);
+                }
+            }
 
-                //loop over Embedding Dimensionality
-                for (int j = 0; j < d; j++) {
-                   float val = fourDimRead(Q, b, h, i, j, H, N, d);
-                   val = 0.0;
-                   fourDimWrite(Q, b, h, i, j, H, N, d, val);
+            for (int qki = 0; qki < N; qki++) {
+                for (int vj = 0; vj < d; vj++) {
+                    float val = 0;
+                    for (int k = 0; k < N; k++) {
+                        float qkval = twoDimRead(QK_t, qki, k, N);
+                        float vval = fourDimRead(V, b, h, k, vj, H, N, d);
+                        val += qkval * vval;
+                    }
+                    fourDimWrite(O, b, h, qki, vj, H, N, d, val);
                 }
             }
         }
     }
 
-    
-    // DO NOT EDIT THIS RETURN STATEMENT //
-    // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
 }
 
@@ -172,9 +159,76 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
+    const int TILE_SIZE = 16;
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int qi = 0; qi < N; qi += TILE_SIZE) {
+                for (int ki = 0; ki < N; ki += TILE_SIZE) {
 
-    // DO NOT EDIT THIS RETURN STATEMENT //
-    // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
+                    // init to zero before dot product
+                    for (int ti = qi; ti < std::min(qi + TILE_SIZE, N); ti++) {
+                        for (int tj = ki; tj < std::min(ki + TILE_SIZE, N); tj++) {
+                            float zero = 0;
+                            twoDimWrite(QK_t, ti, tj, N, zero);
+                        }
+                    }
+
+                    for (int k = 0; k < d; k += TILE_SIZE) {
+                        for (int ti = qi; ti < std::min(qi + TILE_SIZE, N); ti++) {
+                            for (int tj = ki; tj < std::min(ki + TILE_SIZE, N); tj++) {
+
+                                float val = twoDimRead(QK_t, ti, tj, N);
+                                for (int tk = k; tk < std::min(k + TILE_SIZE, d); tk++) {
+                                    float qval = fourDimRead(Q, b, h, ti, tk, H, N, d);
+                                    float kval = fourDimRead(K, b, h, tj, tk, H, N, d);
+                                    val += qval * kval;
+                                }
+                                twoDimWrite(QK_t, ti, tj, N, val);
+
+                            }
+                        }
+                    }
+
+                }
+            }
+
+            for (int i = 0; i < N; i++) {
+                float sum = 0;
+                for (int j = 0; j < N; j++) {
+                    float val = twoDimRead(QK_t, i, j, N);
+                    val = exp(val);
+                    sum += val;
+                    twoDimWrite(QK_t, i, j, N, val);
+                }
+                for (int j = 0; j < N; j++) {
+                    float val = twoDimRead(QK_t, i, j, N);
+                    val /= sum;
+                    twoDimWrite(QK_t, i, j, N, val);
+                }
+            }
+
+            for (int qki = 0; qki < N; qki += TILE_SIZE) {
+                for (int vj = 0; vj < d; vj += TILE_SIZE) {
+                    for (int k = 0; k < N; k += TILE_SIZE) {
+                        for (int ti = qki; ti < std::min(qki + TILE_SIZE, N); ti++) {
+                            for (int tj = vj; tj < std::min(vj + TILE_SIZE, d); tj++) {
+
+                                float val = fourDimRead(O, b, h, ti, tj, H, N, d);
+                                for (int tk = k; tk < std::min(k + TILE_SIZE, N); tk++) {
+                                    float qkval = twoDimRead(QK_t, ti, tk, N);
+                                    float vval = fourDimRead(V, b, h, tk, tj, H, N, d);
+                                    val += qkval * vval;
+                                }
+                                fourDimWrite(O, b, h, ti, tj, H, N, d, val);
+
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
 }
 
