@@ -7,8 +7,8 @@
 #include <immintrin.h>
 
 // Uncomment for ISPC
-//#include "module_ispc.h"
-//using namespace ispc;
+#include "module_ispc.h"
+using namespace ispc;
 
 // ------------------------------------ //
 // 	WARM-UP: ACCESSING TENSORS      //
@@ -159,26 +159,27 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
-    const int TILE_SIZE = 16;
+    const int TILE_H = 64;
+    const int TILE_W = 16;
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
-            for (int qi = 0; qi < N; qi += TILE_SIZE) {
-                for (int ki = 0; ki < N; ki += TILE_SIZE) {
+            for (int qi = 0; qi < N; qi += TILE_H) {
+                for (int ki = 0; ki < N; ki += TILE_H) {
 
                     // init to zero before dot product
-                    for (int ti = qi; ti < std::min(qi + TILE_SIZE, N); ti++) {
-                        for (int tj = ki; tj < std::min(ki + TILE_SIZE, N); tj++) {
+                    for (int ti = qi; ti < std::min(qi + TILE_H, N); ti++) {
+                        for (int tj = ki; tj < std::min(ki + TILE_H, N); tj++) {
                             float zero = 0;
                             twoDimWrite(QK_t, ti, tj, N, zero);
                         }
                     }
 
-                    for (int k = 0; k < d; k += TILE_SIZE) {
-                        for (int ti = qi; ti < std::min(qi + TILE_SIZE, N); ti++) {
-                            for (int tj = ki; tj < std::min(ki + TILE_SIZE, N); tj++) {
+                    for (int k = 0; k < d; k += TILE_W) {
+                        for (int ti = qi; ti < std::min(qi + TILE_H, N); ti++) {
+                            for (int tj = ki; tj < std::min(ki + TILE_H, N); tj++) {
 
                                 float val = twoDimRead(QK_t, ti, tj, N);
-                                for (int tk = k; tk < std::min(k + TILE_SIZE, d); tk++) {
+                                for (int tk = k; tk < std::min(k + TILE_W, d); tk++) {
                                     float q_val = fourDimRead(Q, b, h, ti, tk, H, N, d);
                                     float k_val = fourDimRead(K, b, h, tj, tk, H, N, d);
                                     val += q_val * k_val;
@@ -207,14 +208,14 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                 }
             }
 
-            for (int qki = 0; qki < N; qki += TILE_SIZE) {
-                for (int vj = 0; vj < d; vj += TILE_SIZE) {
-                    for (int k = 0; k < N; k += TILE_SIZE) {
-                        for (int ti = qki; ti < std::min(qki + TILE_SIZE, N); ti++) {
-                            for (int tj = vj; tj < std::min(vj + TILE_SIZE, d); tj++) {
+            for (int qki = 0; qki < N; qki += TILE_H) {
+                for (int vj = 0; vj < d; vj += TILE_H) {
+                    for (int k = 0; k < N; k += TILE_W) {
+                        for (int ti = qki; ti < std::min(qki + TILE_H, N); ti++) {
+                            for (int tj = vj; tj < std::min(vj + TILE_H, d); tj++) {
 
                                 float val = fourDimRead(O, b, h, ti, tj, H, N, d);
-                                for (int tk = k; tk < std::min(k + TILE_SIZE, N); tk++) {
+                                for (int tk = k; tk < std::min(k + TILE_W, N); tk++) {
                                     float qk_val = twoDimRead(QK_t, ti, tk, N);
                                     float v_val = fourDimRead(V, b, h, tk, tj, H, N, d);
                                     val += qk_val * v_val;
@@ -259,7 +260,7 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 
 
     // -------- YOUR CODE HERE  -------- //
-    #pragma omp parallel for collapse(3)
+    // #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             for (int qi = 0; qi < N ; qi++) {
