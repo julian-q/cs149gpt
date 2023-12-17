@@ -13,6 +13,8 @@ using namespace ispc;
 // ------------------------------------ //
 // 	WARM-UP: ACCESSING TENSORS      //
 // ------------------------------------ //
+int INT_ZERO = 0;
+float FLOAT_ZERO = 0;
 
 // Step #1: Understand Read/Write Accessors for a 2D Tensor
 inline float twoDimRead(std::vector<float> &tensor, int &x, int &y, const int &sizeX) {
@@ -24,6 +26,10 @@ inline void twoDimWrite(std::vector<float> &tensor, int &x, int &y, const int &s
     tensor[x * (sizeX) + y] = val;
 }
 
+inline float* twoDimPtr(std::vector<float> &tensor, int &x, int &y, const int &sizeX) {
+    return tensor.data() + (x * (sizeX)+ y);
+}
+
 // Step #2: Implement Read/Write Accessors for a 4D Tensor
 inline float fourDimRead(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
         const int &sizeX, const int &sizeY, const int &sizeZ) {
@@ -33,6 +39,11 @@ inline float fourDimRead(std::vector<float> &tensor, int &x, int &y, int &z, int
 inline void fourDimWrite(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
         const int &sizeX, const int &sizeY, const int &sizeZ, float &val) {
     tensor[x * (sizeX*sizeY*sizeZ) + y * (sizeY*sizeZ) + z * (sizeZ) + b] = val;
+}
+
+inline float* fourDimPtr(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
+        const int &sizeX, const int &sizeY, const int &sizeZ) {
+    return tensor.data() + (x * (sizeX*sizeY*sizeZ) + y * (sizeY*sizeZ) + z * (sizeZ) + b);
 }
 
 // DO NOT EDIT THIS FUNCTION //
@@ -93,13 +104,20 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
         for (int h = 0; h < H; h++) {
             for (int qi = 0; qi < N; qi++) {
                 for (int ki = 0; ki < N; ki++) {
-                    float val = 0;
-                    for (int k = 0; k < d; k++) {
-                        float q_val = fourDimRead(Q, b, h, qi, k, H, N, d);
-                        float k_val = fourDimRead(K, b, h, ki, k, H, N, d);
-                        val += q_val * k_val;
-                    }
+                    // ispc dot product
+                    float* Q_vec = fourDimPtr(Q, b, h, qi, INT_ZERO, H, N, d);
+                    float* K_vec = fourDimPtr(K, b, h, ki, INT_ZERO, H, N, d);
+                    float val = dot_product(d, Q_vec, 1, K_vec, 1);
+                    // naive dot product
+                    /// float val = 0;
+                    /// for (int k = 0; k < d; k++) {
+                    ///     float q_val = fourDimRead(Q, b, h, qi, k, H, N, d);
+                    ///     float k_val = fourDimRead(K, b, h, ki, k, H, N, d);
+                    ///     val += q_val * k_val;
+                    /// }
+
                     twoDimWrite(QK_t, qi, ki, N, val);
+
                 }
             }
 
@@ -120,13 +138,20 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 
             for (int qki = 0; qki < N; qki++) {
                 for (int vj = 0; vj < d; vj++) {
-                    float val = 0;
-                    for (int k = 0; k < N; k++) {
-                        float qk_val = twoDimRead(QK_t, qki, k, N);
-                        float v_val = fourDimRead(V, b, h, k, vj, H, N, d);
-                        val += qk_val * v_val;
-                    }
+                    // ispc dot product
+                    float* QK_vec = twoDimPtr(QK_t, qki, INT_ZERO, N);
+                    float* V_vec = fourDimPtr(V, b, h, INT_ZERO, vj, H, N, d);
+                    float val = dot_product(N, QK_vec, 1, V_vec, d);
+                    // naive dot product
+                    /// float val = 0;
+                    /// for (int k = 0; k < N; k++) {
+                    ///     float qk_val = twoDimRead(QK_t, qki, k, N);
+                    ///     float v_val = fourDimRead(V, b, h, k, vj, H, N, d);
+                    ///     val += qk_val * v_val;
+                    /// }
+                    
                     fourDimWrite(O, b, h, qki, vj, H, N, d, val);
+
                 }
             }
         }
@@ -165,21 +190,22 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
         for (int h = 0; h < H; h++) {
             for (int qi = 0; qi < N; qi += TILE_H) {
                 for (int ki = 0; ki < N; ki += TILE_H) {
-
-                    // init to zero before dot product
-                    for (int ti = qi; ti < std::min(qi + TILE_H, N); ti++) {
-                        for (int tj = ki; tj < std::min(ki + TILE_H, N); tj++) {
-                            float zero = 0;
-                            twoDimWrite(QK_t, ti, tj, N, zero);
+                    const int Q_TILE_H = std::min(TILE_H, N - qi);
+                    const int K_TILE_H = std::min(TILE_H, N - ki);
+                    // init to zero for each head
+                    for (int ti = qi; ti < qi + Q_TILE_H; ti++) {
+                        for (int tj = ki; tj < ki + K_TILE_H; tj++) {
+                            twoDimWrite(QK_t, ti, tj, N, FLOAT_ZERO);
                         }
                     }
 
                     for (int k = 0; k < d; k += TILE_W) {
-                        for (int ti = qi; ti < std::min(qi + TILE_H, N); ti++) {
-                            for (int tj = ki; tj < std::min(ki + TILE_H, N); tj++) {
+                        const int QK_TILE_W = std::min(TILE_W, d - k);
 
+                        for (int ti = qi; ti < qi + Q_TILE_H; ti++) {
+                            for (int tj = ki; tj < ki + K_TILE_H; tj++) {
                                 float val = twoDimRead(QK_t, ti, tj, N);
-                                for (int tk = k; tk < std::min(k + TILE_W, d); tk++) {
+                                for (int tk = k; tk < k + QK_TILE_W; tk++) {
                                     float q_val = fourDimRead(Q, b, h, ti, tk, H, N, d);
                                     float k_val = fourDimRead(K, b, h, tj, tk, H, N, d);
                                     val += q_val * k_val;
@@ -189,7 +215,6 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                             }
                         }
                     }
-
                 }
             }
 
@@ -211,17 +236,19 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
             for (int qki = 0; qki < N; qki += TILE_H) {
                 for (int vj = 0; vj < d; vj += TILE_H) {
                     for (int k = 0; k < N; k += TILE_W) {
-                        for (int ti = qki; ti < std::min(qki + TILE_H, N); ti++) {
-                            for (int tj = vj; tj < std::min(vj + TILE_H, d); tj++) {
+                        const int QK_TILE_H = std::min(TILE_H, N - qki);
+                        const int V_TILE_H = std::min(TILE_H, d - vj);
+                        const int QKV_TILE_W = std::min(TILE_W, N - k);
 
+                        for (int ti = qki; ti < qki + QK_TILE_H; ti++) {
+                            for (int tj = vj; tj < vj + V_TILE_H; tj++) {
                                 float val = fourDimRead(O, b, h, ti, tj, H, N, d);
-                                for (int tk = k; tk < std::min(k + TILE_W, N); tk++) {
+                                for (int tk = k; tk < k + QKV_TILE_W; tk++) {
                                     float qk_val = twoDimRead(QK_t, ti, tk, N);
                                     float v_val = fourDimRead(V, b, h, tk, tj, H, N, d);
                                     val += qk_val * v_val;
                                 }
                                 fourDimWrite(O, b, h, ti, tj, H, N, d, val);
-
                             }
                         }
                     }
@@ -260,7 +287,7 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 
 
     // -------- YOUR CODE HERE  -------- //
-    // #pragma omp parallel for collapse(3)
+    #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             for (int qi = 0; qi < N ; qi++) {
@@ -375,15 +402,18 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                     // S = QK^T
                     for (int si = 0; si < Q_TILE_SIZE; si++) {
                         for (int sj = 0; sj < K_TILE_SIZE; sj++) {
-
-                            float val = 0;
-                            for (int k = 0; k < d; k++) {
-                                float q_val = twoDimRead(Qi, si, k, d);
-                                float k_val = twoDimRead(Kj, sj, k, d);
-                                val += q_val * k_val;
-                            }
+                            // ispc dot product
+                            float* Q_vec = twoDimPtr(Qi, si, INT_ZERO, d);
+                            float* K_vec = twoDimPtr(Kj, sj, INT_ZERO, d);
+                            float val = dot_product(d, Q_vec, 1, K_vec, 1);
+                            // naive dot product
+                            /// float val = 0;
+                            /// for (int k = 0; k < d; k++) {
+                            ///     float q_val = twoDimRead(Qi, si, k, d);
+                            ///     float k_val = twoDimRead(Kj, sj, k, d);
+                            ///     val += q_val * k_val;
+                            /// }
                             twoDimWrite(Sij, si, sj, Bc, val);
-
                         }
                     }
 
@@ -414,12 +444,17 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                     // PV
                     for (int pi = 0; pi < Q_TILE_SIZE; pi++) {
                         for (int vj = 0; vj < d; vj++) {
-                            float val = 0;
-                            for (int k = 0; k < K_TILE_SIZE; k++) {
-                                float p_val = twoDimRead(Pij, pi, k, Bc);
-                                float v_val = twoDimRead(Vj, k, vj, d);
-                                val += p_val * v_val;
-                            }
+                            // ispc dot product
+                            float* P_vec = twoDimPtr(Pij, pi, INT_ZERO, Bc);
+                            float* V_vec = twoDimPtr(Vj, INT_ZERO, vj, d);
+                            float val = dot_product(K_TILE_SIZE, P_vec, 1, V_vec, d);
+                            // naive dot product
+                            /// float val = 0;
+                            /// for (int k = 0; k < K_TILE_SIZE; k++) {
+                            ///     float p_val = twoDimRead(Pij, pi, k, Bc);
+                            ///     float v_val = twoDimRead(Vj, k, vj, d);
+                            ///     val += p_val * v_val;
+                            /// }
                             twoDimWrite(PV, pi, vj, d, val);
                         }
                     }
@@ -463,3 +498,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("twoDimRead", &twoDimRead, "twoDimRead");
   m.def("fourDimRead", &fourDimRead, "fourDimRead");
 }
+
